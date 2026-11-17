@@ -1,4 +1,5 @@
 #!/usr/bin/env python3
+from __future__ import annotations
 import json
 import os
 import sqlite3
@@ -11,6 +12,7 @@ from datetime import datetime, timezone
 from zoneinfo import ZoneInfo
 
 OPENCODE_DB = os.path.expanduser("~/.local/share/opencode/opencode.db")
+AGY_QUOTA = os.path.expanduser("~/.local/bin/agy-quota")
 GEMINI_DAILY_REQUESTS = {"gemini-3.5-flash-lite": 500, "gemini-3.1-flash-lite": 500}
 GEMINI_DEFAULT_DAILY_REQUESTS = 20
 STATUS_ANSI = {"ok": "\033[92m", "warn": "\033[93m", "full": "\033[91m", "none": "\033[90m"}
@@ -90,7 +92,7 @@ def local_items(provider, since_ms, limit_for_model=None):
 
 def antigravity():
     section = Section("Antigravity", "sparkles", "pool left", "")
-    result = subprocess.run([os.path.expanduser("~/.local/bin/agy-quota")], capture_output=True, text=True)
+    result = subprocess.run([AGY_QUOTA], capture_output=True, text=True)
     if result.returncode or not result.stdout.strip():
         section.items.append(Item("Hub not running — open Antigravity.app", ""))
         return section
@@ -164,6 +166,10 @@ def cloudflare():
     return section
 
 
+def has_env(*names):
+    return all(os.environ.get(name) for name in names)
+
+
 def bar(fraction, width):
     filled = round(width * min(fraction, 1))
     return "▰" * filled + "▱" * (width - filled)
@@ -208,7 +214,16 @@ def print_swiftbar(sections):
 
 
 def main():
-    sections = [antigravity(), openrouter(), cerebras(), gemini(), zai(), cloudflare()]
+    has_opencode = os.path.exists(OPENCODE_DB)
+    providers = [
+        (antigravity, os.path.exists(AGY_QUOTA)),
+        (openrouter, has_env("OPENROUTER_API_KEY")),
+        (cerebras, has_env("CEREBRAS_API_KEY")),
+        (gemini, has_opencode),
+        (zai, has_opencode),
+        (cloudflare, has_opencode and has_env("CLOUDFLARE_ACCOUNT_ID", "CLOUDFLARE_API_KEY")),
+    ]
+    sections = [provider() for provider, ready in providers if ready]
     if "--swiftbar" in sys.argv:
         print_swiftbar(sections)
     else:
