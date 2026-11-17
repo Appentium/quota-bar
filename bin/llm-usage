@@ -161,6 +161,12 @@ def zai():
     return section
 
 
+def opencode_zen():
+    section = Section("OpenCode Zen", "chevron.left.forwardslash.chevron.right", "opencode only · free models, rate-limited", "https://opencode.ai/zen")
+    section.items = local_items("opencode", day_start_ms(None))
+    return section
+
+
 def cloudflare():
     section = Section("Cloudflare", "cloud.fill", f"resets {local_reset_time(timezone.utc)}", "https://dash.cloudflare.com/?to=/:account/ai/workers-ai")
     account = os.environ["CLOUDFLARE_ACCOUNT_ID"]
@@ -232,6 +238,7 @@ def main():
         (cerebras, has_env("CEREBRAS_API_KEY")),
         (gemini, has_opencode),
         (zai, has_opencode),
+        (opencode_zen, has_opencode),
         (cloudflare, has_opencode and has_env("CLOUDFLARE_ACCOUNT_ID", "CLOUDFLARE_API_KEY")),
     ]
     sections = [provider() for provider, ready in providers if ready]
