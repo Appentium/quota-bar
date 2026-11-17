@@ -2,6 +2,8 @@
 
 Daily usage and limits for free AI models, in the terminal and the macOS menu bar.
 
+![Menu bar](docs/menu-bar.png)
+
 ## Restore on a new Mac
 
 ```bash
