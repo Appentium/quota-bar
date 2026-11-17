@@ -1,4 +1,4 @@
-# ai-toolkit
+# quota-bar
 
 **See every free AI model quota you have, in one place, right in your Mac menu bar.**
 
@@ -31,10 +31,10 @@ Free tiers are generous when you combine them (OpenRouter, Cerebras, Gemini, Z.a
 ## Install
 
 ```bash
-git clone https://github.com/Appentium/ai-toolkit ~/ai-toolkit
+git clone https://github.com/Appentium/quota-bar ~/quota-bar
 mkdir -p ~/.local/bin ~/.swiftbar
-ln -s ~/ai-toolkit/bin/llm-usage ~/.local/bin/llm-usage
-ln -s ~/ai-toolkit/swiftbar/llm-usage.15m.sh ~/.swiftbar/llm-usage.15m.sh
+ln -s ~/quota-bar/bin/llm-usage ~/.local/bin/llm-usage
+ln -s ~/quota-bar/swiftbar/llm-usage.15m.sh ~/.swiftbar/llm-usage.15m.sh
 brew install --cask swiftbar
 defaults write com.ameba.SwiftBar PluginDirectory -string "$HOME/.swiftbar"
 open -a SwiftBar
