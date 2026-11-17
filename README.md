@@ -26,7 +26,7 @@ Free tiers are generous when you combine them (OpenRouter, Cerebras, Gemini, Z.a
 | Google Gemini | opencode history | requests per model vs the free-tier daily limit |
 | Z.ai | opencode history | requests and tokens per model |
 | Cloudflare Workers AI | live GraphQL + opencode history | neurons used of 10,000/day, requests per model |
-| Antigravity | `agy-quota` helper in `~/.local/bin` | % left in each model pool and reset time |
+| Antigravity | local Antigravity.app hub (must be running) | % left in every 5-hour and weekly pool, reset times |
 
 ## Install
 

@@ -1,9 +1,9 @@
 #!/usr/bin/env python3
 from __future__ import annotations
+import glob
 import json
 import os
 import sqlite3
-import subprocess
 import sys
 import urllib.error
 import urllib.request
@@ -12,7 +12,8 @@ from datetime import datetime, timezone
 from zoneinfo import ZoneInfo
 
 OPENCODE_DB = os.path.expanduser("~/.local/share/opencode/opencode.db")
-AGY_QUOTA = os.path.expanduser("~/.local/bin/agy-quota")
+GROUP_MODELS_PREFIX = "Models within this group: "
+ANTIGRAVITY_HUBS = os.path.expanduser("~/.gemini/antigravity/daemon/hub_*.json")
 GEMINI_DAILY_REQUESTS = {"gemini-3.5-flash-lite": 500, "gemini-3.1-flash-lite": 500}
 GEMINI_DEFAULT_DAILY_REQUESTS = 20
 STATUS_ANSI = {"ok": "\033[92m", "warn": "\033[93m", "full": "\033[91m", "none": "\033[90m"}
@@ -48,7 +49,7 @@ class Section:
 
 
 def http_json(url, headers, body=None):
-    request = urllib.request.Request(url, headers=headers, data=json.dumps(body).encode() if body else None)
+    request = urllib.request.Request(url, headers=headers, data=None if body is None else json.dumps(body).encode())
     try:
         with urllib.request.urlopen(request, timeout=20) as response:
             return json.load(response), response.headers
@@ -91,18 +92,28 @@ def local_items(provider, since_ms, limit_for_model=None):
 
 
 def antigravity():
-    section = Section("Antigravity", "sparkles", "pool left", "")
-    result = subprocess.run([AGY_QUOTA], capture_output=True, text=True)
-    if result.returncode or not result.stdout.strip():
+    section = Section("Antigravity", "sparkles", "left in shared pools", "")
+    with open(max(glob.glob(ANTIGRAVITY_HUBS), key=os.path.getmtime)) as hub_file:
+        hub = json.load(hub_file)
+    url = f"http://127.0.0.1:{hub['httpPort']}/exa.language_server_pb.LanguageServerService/RetrieveUserQuotaSummary"
+    headers = {"Content-Type": "application/json", "x-codeium-csrf-token": hub["csrfToken"]}
+    data, _ = http_json(url, headers, {})
+    if "error" in data:
         section.items.append(Item("Hub not running — open Antigravity.app", ""))
         return section
-    for line in result.stdout.split("\n"):
-        if not line:
-            continue
-        model, remaining, reset = line.split()
-        reset_local = datetime.fromisoformat(reset.replace("Z", "+00:00")).astimezone().strftime("%a %H:%M")
-        left = float(remaining)
-        section.items.append(Item(model.removesuffix("-high"), f"{left:.0%} left", 1 - left, [f"Resets {reset_local}"]))
+    for group in data["response"]["groups"]:
+        name = group["displayName"].removesuffix(" models").removesuffix(" Models").replace(" and ", "/").replace("Gemini 4 ", "")
+        for bucket in group["buckets"]:
+            label = f"{name} · {bucket['window']}"
+            if bucket.get("disabled"):
+                section.items.append(Item(label, "paused", details=[bucket["description"]]))
+                continue
+            left = bucket["remainingFraction"]
+            reset_local = datetime.fromisoformat(bucket["resetTime"].replace("Z", "+00:00")).astimezone().strftime("%a %H:%M")
+            details = [f"Resets {reset_local}"]
+            if group["description"].startswith(GROUP_MODELS_PREFIX):
+                details.append(group["description"].replace(GROUP_MODELS_PREFIX, "Shared by "))
+            section.items.append(Item(label, f"{left:.0%} left", 1 - left, details))
     return section
 
 
@@ -216,7 +227,7 @@ def print_swiftbar(sections):
 def main():
     has_opencode = os.path.exists(OPENCODE_DB)
     providers = [
-        (antigravity, os.path.exists(AGY_QUOTA)),
+        (antigravity, bool(glob.glob(ANTIGRAVITY_HUBS))),
         (openrouter, has_env("OPENROUTER_API_KEY")),
         (cerebras, has_env("CEREBRAS_API_KEY")),
         (gemini, has_opencode),
