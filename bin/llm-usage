@@ -1,0 +1,219 @@
+#!/usr/bin/env python3
+import json
+import os
+import sqlite3
+import subprocess
+import sys
+import urllib.error
+import urllib.request
+from dataclasses import dataclass, field
+from datetime import datetime, timezone
+from zoneinfo import ZoneInfo
+
+OPENCODE_DB = os.path.expanduser("~/.local/share/opencode/opencode.db")
+GEMINI_DAILY_REQUESTS = {"gemini-3.5-flash-lite": 500, "gemini-3.1-flash-lite": 500}
+GEMINI_DEFAULT_DAILY_REQUESTS = 20
+STATUS_ANSI = {"ok": "\033[92m", "warn": "\033[93m", "full": "\033[91m", "none": "\033[90m"}
+
+
+def status_for(used_fraction):
+    if used_fraction is None:
+        return "none"
+    if used_fraction >= 0.9:
+        return "full"
+    return "warn" if used_fraction >= 0.7 else "ok"
+
+
+@dataclass
+class Item:
+    label: str
+    value: str
+    used_fraction: float | None = None
+    details: list[str] = field(default_factory=list)
+
+    @property
+    def status(self):
+        return status_for(self.used_fraction)
+
+
+@dataclass
+class Section:
+    title: str
+    symbol: str
+    note: str
+    link: str
+    items: list[Item] = field(default_factory=list)
+
+
+def http_json(url, headers, body=None):
+    request = urllib.request.Request(url, headers=headers, data=json.dumps(body).encode() if body else None)
+    try:
+        with urllib.request.urlopen(request, timeout=20) as response:
+            return json.load(response), response.headers
+    except (urllib.error.URLError, TimeoutError) as error:
+        return {"error": str(error)}, {}
+
+
+def day_start_ms(zone):
+    now = datetime.now(zone)
+    return int(now.replace(hour=0, minute=0, second=0, microsecond=0).timestamp() * 1000)
+
+
+def local_reset_time(zone):
+    return datetime.fromtimestamp(day_start_ms(zone) / 1000).strftime("%H:%M")
+
+
+def count_item(label, used, limit, unit):
+    return Item(label, f"{used:,} / {limit:,} {unit}", used / limit)
+
+
+def local_items(provider, since_ms, limit_for_model=None):
+    query = """
+        select json_extract(m.data, '$.modelID'), count(*),
+               sum(json_extract(p.data, '$.tokens.input') + json_extract(p.data, '$.tokens.output'))
+        from part p join message m on m.id = p.message_id
+        where json_extract(p.data, '$.type') = 'step-finish'
+          and json_extract(m.data, '$.providerID') = ? and p.time_created >= ?
+        group by 1 order by 2 desc"""
+    with sqlite3.connect(f"file:{OPENCODE_DB}?mode=ro", uri=True) as db:
+        rows = db.execute(query, (provider, since_ms)).fetchall()
+    if not rows:
+        return [Item("No opencode use today", "")]
+    items = []
+    for model, requests, tokens in rows:
+        label = model.rsplit("/", 1)[-1]
+        item = count_item(label, requests, limit_for_model(model), "req") if limit_for_model else Item(label, f"{requests:,} req")
+        item.details.append(f"{tokens or 0:,} tokens today")
+        items.append(item)
+    return items
+
+
+def antigravity():
+    section = Section("Antigravity", "sparkles", "pool left", "")
+    result = subprocess.run([os.path.expanduser("~/.local/bin/agy-quota")], capture_output=True, text=True)
+    if result.returncode or not result.stdout.strip():
+        section.items.append(Item("Hub not running — open Antigravity.app", ""))
+        return section
+    for line in result.stdout.split("\n"):
+        if not line:
+            continue
+        model, remaining, reset = line.split()
+        reset_local = datetime.fromisoformat(reset.replace("Z", "+00:00")).astimezone().strftime("%a %H:%M")
+        left = float(remaining)
+        section.items.append(Item(model.removesuffix("-high"), f"{left:.0%} left", 1 - left, [f"Resets {reset_local}"]))
+    return section
+
+
+def openrouter():
+    section = Section("OpenRouter", "arrow.triangle.branch", f"resets {local_reset_time(timezone.utc)}", "https://openrouter.ai/activity")
+    data, _ = http_json("https://openrouter.ai/api/v1/key", {"Authorization": f"Bearer {os.environ['OPENROUTER_API_KEY']}"})
+    if "error" in data:
+        section.items.append(Item("Unavailable", data["error"]))
+        return section
+    free = data["data"]["free_model_daily_requests"]
+    item = count_item(":free requests", free["used"], free["limit"], "req")
+    item.details.append(f"Credit spent this month ${data['data']['usage_monthly']:.4f}")
+    section.items.append(item)
+    return section
+
+
+def cerebras():
+    section = Section("Cerebras", "bolt.fill", "live", "https://cloud.cerebras.ai")
+    body = {"model": "gpt-oss-120b", "max_tokens": 1, "messages": [{"role": "user", "content": "hi"}]}
+    headers = {"Authorization": f"Bearer {os.environ['CEREBRAS_API_KEY']}", "Content-Type": "application/json"}
+    data, response_headers = http_json("https://api.cerebras.ai/v1/chat/completions", headers, body)
+    if "error" in data:
+        section.items.append(Item("Unavailable", data["error"]))
+        return section
+    for kind, unit in (("requests", "req"), ("tokens", "tok")):
+        limit = int(response_headers[f"x-ratelimit-limit-{kind}-day"])
+        remaining = int(response_headers[f"x-ratelimit-remaining-{kind}-day"])
+        section.items.append(count_item(f"{kind.capitalize()} today", limit - remaining, limit, unit))
+    return section
+
+
+def gemini():
+    section = Section("Gemini", "diamond.fill", f"opencode only · resets {local_reset_time(ZoneInfo('America/Los_Angeles'))}", "https://aistudio.google.com")
+    section.items = local_items(
+        "google",
+        day_start_ms(ZoneInfo("America/Los_Angeles")),
+        lambda model: GEMINI_DAILY_REQUESTS.get(model, GEMINI_DEFAULT_DAILY_REQUESTS),
+    )
+    return section
+
+
+def zai():
+    section = Section("Z.ai", "z.square.fill", "opencode only · no daily cap", "https://z.ai/manage-apikey/apikey-list")
+    section.items = local_items("zai", day_start_ms(None))
+    return section
+
+
+def cloudflare():
+    section = Section("Cloudflare", "cloud.fill", f"resets {local_reset_time(timezone.utc)}", "https://dash.cloudflare.com/?to=/:account/ai/workers-ai")
+    account = os.environ["CLOUDFLARE_ACCOUNT_ID"]
+    today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+    query = f'{{viewer{{accounts(filter:{{accountTag:"{account}"}}){{aiInferenceAdaptiveGroups(limit:50,filter:{{date_geq:"{today}"}}){{sum{{totalNeurons}}}}}}}}}}'
+    headers = {"Authorization": f"Bearer {os.environ['CLOUDFLARE_API_KEY']}", "Content-Type": "application/json"}
+    data, _ = http_json("https://api.cloudflare.com/client/v4/graphql", headers, {"query": query})
+    if data.get("data"):
+        groups = data["data"]["viewer"]["accounts"][0]["aiInferenceAdaptiveGroups"]
+        section.items.append(count_item("Neurons", round(sum(group["sum"]["totalNeurons"] for group in groups)), 10_000, "neu"))
+    else:
+        section.items.append(Item("Neurons", "needs Analytics Read", details=["Add 'Account Analytics: Read' to the API token"]))
+    section.items += local_items("cloudflare-workers-ai", day_start_ms(timezone.utc))
+    return section
+
+
+def bar(fraction, width):
+    filled = round(width * min(fraction, 1))
+    return "▰" * filled + "▱" * (width - filled)
+
+
+def print_terminal(sections):
+    reset, bold, dim = "\033[0m", "\033[1m", "\033[2m"
+    print(f"{bold}Free model usage{reset} {dim}· {datetime.now().strftime('%a %d %b %H:%M')}{reset}\n")
+    for section in sections:
+        print(f"{bold}{section.title}{reset} {dim}{section.note}{reset}")
+        for item in section.items:
+            color = STATUS_ANSI[item.status]
+            meter = bar(item.used_fraction, 16) if item.used_fraction is not None else " " * 16
+            print(f"  {color}●{reset} {item.label:<26} {color}{meter}{reset}  {item.value}")
+            for detail in item.details:
+                print(f"    {dim}{detail}{reset}")
+        print()
+
+
+def print_swiftbar(sections):
+    fractions = [item.used_fraction for section in sections for item in section.items if item.used_fraction is not None]
+    overall = status_for(sum(fractions) / len(fractions) if fractions else None)
+    reset = "\033[0m"
+    print(f"{STATUS_ANSI[overall]}●{reset} AI | ansi=true")
+    print("---")
+    print(f"Free model usage · {datetime.now().strftime('%H:%M')} | size=12 color=#8E8E93,#98989D")
+    # SwiftBar ignores sfcolor inside menus, so status colors go through ANSI.
+    row_style = "ansi=true font=.AppleSystemUIFontMonospaced-Regular size=13 trim=false"
+    for section in sections:
+        print("---")
+        # Rows without an action render greyed out, so every row gets one.
+        action = f"href={section.link}" if section.link else "refresh=true"
+        print(f"{section.title.upper()}   {section.note} | size=11 color=#8E8E93,#98989D sfimage={section.symbol} sfsize=11 {action}")
+        for item in section.items:
+            color = STATUS_ANSI[item.status]
+            meter = bar(item.used_fraction, 10) if item.used_fraction is not None else ""
+            print(f"{color}●{reset}  {item.label:<22}{item.value:>18}  {color}{meter}{reset} | {row_style} {action}")
+            for detail in item.details:
+                print(f"--{detail} | size=12")
+    print("---")
+    print("Refresh | refresh=true sfimage=arrow.clockwise")
+
+
+def main():
+    sections = [antigravity(), openrouter(), cerebras(), gemini(), zai(), cloudflare()]
+    if "--swiftbar" in sys.argv:
+        print_swiftbar(sections)
+    else:
+        print_terminal(sections)
+
+
+if __name__ == "__main__":
+    main()
