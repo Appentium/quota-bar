@@ -179,6 +179,11 @@ def cloudflare():
         section.items.append(count_item("Neurons", round(sum(group["sum"]["totalNeurons"] for group in groups)), 10_000, "neu"))
     else:
         section.items.append(Item("Neurons", "needs Analytics Read", details=["Add 'Account Analytics: Read' to the API token"]))
+    probe_url = f"https://api.cloudflare.com/client/v4/accounts/{account}/ai/run/@cf/meta/llama-3.2-1b-instruct"
+    probe, _ = http_json(probe_url, headers, {"messages": [{"role": "user", "content": "hi"}], "max_tokens": 1})
+    # Enforcement can outlast the 00:00 UTC reset, so the neuron counter alone can read 0 while blocked.
+    if "429" in probe.get("error", ""):
+        section.items.append(Item("Requests", "blocked", 1.0, ["API refuses calls even if the counter reads 0"]))
     section.items += local_items("cloudflare-workers-ai", day_start_ms(timezone.utc))
     return section
 

@@ -59,7 +59,7 @@ Add whichever you have to `~/.zshrc`. Each key is only sent to its own provider.
 
 ## Notes
 
-- The Cerebras check sends one 1-token request per refresh (about 96 a day at the default interval).
+- The Cerebras and Cloudflare checks each send one 1-token request per refresh (about 96 a day at the default interval). Cloudflare can keep refusing calls after its 00:00 UTC reset, so its row shows "blocked" when the API returns 429.
 - Gemini, Z.ai and OpenCode Zen have no usage API, so only requests made through opencode are counted. Your AI Studio dashboard stays the source of truth.
 - Status colors: green under 70% used, yellow 70–90%, red 90% and above.
 
