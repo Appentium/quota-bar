@@ -14,6 +14,7 @@ Free tiers are generous when you combine them (OpenRouter, Cerebras, Gemini, Z.a
 - Reset times shown in your own time zone
 - Click any provider to open its dashboard
 - Same view in the terminal: `llm-usage`
+- Everything the terminal does is in the menu too: **Best models now** (click to copy), and **Tools** with Copy best models list, Copy all data as JSON and Edit known limits
 - Single Python file, standard library only, works with the Python that ships with macOS
 - Finds providers by itself: any of the 300+ providers in the [models.dev](https://models.dev) catalog shows up once you use it through opencode (last 7 days) or log in to it there, and disappears when you stop. Providers disabled in opencode stay hidden
 - Flags models the catalog marks deprecated or no longer offers

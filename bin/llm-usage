@@ -382,7 +382,7 @@ def print_terminal(sections):
         print()
 
 
-def print_swiftbar(sections, hidden):
+def print_swiftbar(sections, hidden, models):
     script = os.path.abspath(sys.argv[0])
     fractions = [item.used_fraction for section in sections for item in section.items if item.used_fraction is not None]
     overall = status_for(sum(fractions) / len(fractions) if fractions else None)
@@ -404,6 +404,16 @@ def print_swiftbar(sections, hidden):
             for detail in item.details:
                 print(f"--{detail} | size=12")
     print("---")
+    print("Best models now | sfimage=star")
+    print("--Click one to copy it, most room first | size=11 color=#8E8E93,#98989D")
+    for model in models:
+        print(f"--{model} | bash={script} param1=--copy param2={model} terminal=false")
+    if not models:
+        print("--No recent opencode model has room | size=12")
+    print("Tools | sfimage=wrench.and.screwdriver")
+    print(f"--Copy best models list | bash={script} param1=--pick param2=--copy terminal=false sfimage=list.number")
+    print(f"--Copy all data as JSON | bash={script} param1=--json param2=--copy terminal=false sfimage=curlybraces")
+    print(f"--Edit known limits | bash=/usr/bin/open param1=-t param2={os.path.realpath(PROVIDER_NOTES)} terminal=false sfimage=pencil")
     print("Hide | sfimage=eye.slash")
     for section in sections:
         print(f"--{section.title} | bash={script} param1=--hide param2={section.provider} param3='{section.title}' terminal=false refresh=true")
@@ -488,6 +498,11 @@ def track_history(sections):
     return alerts
 
 
+def copy_to_clipboard(text):
+    subprocess.run(["pbcopy"], input=text.encode(), check=False)
+    notify(f"Copied {text.splitlines()[0][:60]}" if text else "Nothing to copy")
+
+
 def notify(message):
     subprocess.run(["osascript", "-e", f"display notification {json.dumps(message, ensure_ascii=False)} with title \"quota-bar\""], check=False)
 
@@ -513,6 +528,9 @@ def main():
         provider = sys.argv[2]
         save_hidden({**hidden, provider: sys.argv[3] if len(sys.argv) > 3 else provider})
         return
+    if sys.argv[1:2] == ["--copy"]:
+        copy_to_clipboard(sys.argv[2])
+        return
     if sys.argv[1:2] == ["--show"]:
         hidden.pop(sys.argv[2], None)
         save_hidden(hidden)
@@ -522,14 +540,19 @@ def main():
     sections = [section for section in sections if section]
     for alert in track_history(sections):
         notify(alert)
+    output = None
     if "--json" in sys.argv:
-        print(json.dumps([asdict(section) for section in sections], indent=2))
+        output = json.dumps([asdict(section) for section in sections], indent=2)
     elif "--pick" in sys.argv:
-        print("\n".join(usable_models(sections)))
+        output = "\n".join(usable_models(sections))
     elif "--swiftbar" in sys.argv:
-        print_swiftbar(sections, hidden)
+        print_swiftbar(sections, hidden, usable_models(sections))
     else:
         print_terminal(sections)
+    if output is not None and "--copy" in sys.argv:
+        copy_to_clipboard(output)
+    elif output is not None:
+        print(output)
 
 
 if __name__ == "__main__":
