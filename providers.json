@@ -1,0 +1,14 @@
+{
+  "google": {
+    "link": "https://aistudio.google.com",
+    "reset_zone": "America/Los_Angeles",
+    "daily_requests": {"gemini-3.5-flash-lite": 500, "gemini-3.1-flash-lite": 500, "*": 20}
+  },
+  "groq": {"api": "https://api.groq.com/openai/v1", "link": "https://console.groq.com/dashboard/usage"},
+  "cerebras": {"api": "https://api.cerebras.ai/v1"},
+  "mistral": {"api": "https://api.mistral.ai/v1"},
+  "openai": {"api": "https://api.openai.com/v1"},
+  "togetherai": {"api": "https://api.together.xyz/v1"},
+  "deepinfra": {"api": "https://api.deepinfra.com/v1/openai"},
+  "xai": {"api": "https://api.x.ai/v1"}
+}

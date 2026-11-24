@@ -21,8 +21,7 @@ CATALOG_URL = "https://models.dev/api.json"
 RECENT_USE_DAYS = 7
 GROUP_MODELS_PREFIX = "Models within this group: "
 ANTIGRAVITY_HUBS = os.path.expanduser("~/.gemini/antigravity/daemon/hub_*.json")
-GEMINI_DAILY_REQUESTS = {"gemini-3.5-flash-lite": 500, "gemini-3.1-flash-lite": 500}
-GEMINI_DEFAULT_DAILY_REQUESTS = 20
+PROVIDER_NOTES = os.path.join(os.path.dirname(os.path.realpath(__file__)), "..", "providers.json")
 CLOUDFLARE_DAILY_NEURONS = 10_000
 CLOUDFLARE_OUT_OF_NEURONS = 4006
 HIDDEN_FILE = os.path.expanduser("~/.config/quota-bar/hidden.json")
@@ -43,6 +42,7 @@ class Item:
     value: str
     used_fraction: float | None = None
     details: list[str] = field(default_factory=list)
+    model: str = ""
 
     @property
     def status(self):
@@ -97,6 +97,7 @@ def load_catalog():
 
 
 CATALOG = load_catalog()
+KNOWN = read_json(PROVIDER_NOTES, {})
 
 
 def day_start_ms(zone):
@@ -152,6 +153,7 @@ def local_items(provider, since_ms, limit_for_model=None):
     for model, requests, tokens in rows:
         label = model.rsplit("/", 1)[-1]
         item = count_item(label, requests, limit_for_model(model), "req") if limit_for_model else Item(label, f"{requests:,} req")
+        item.model = model
         notice = model_notice(provider, model)
         if notice:
             item.details.append(notice)
@@ -220,41 +222,56 @@ def cerebras():
     return section
 
 
-def gemini():
-    section = Section("Gemini", "diamond.fill", f"opencode only · resets {local_reset_time(ZoneInfo('America/Los_Angeles'))}", "https://aistudio.google.com")
-    section.items = local_items(
-        "google",
-        day_start_ms(ZoneInfo("America/Los_Angeles")),
-        lambda model: GEMINI_DAILY_REQUESTS.get(model, GEMINI_DEFAULT_DAILY_REQUESTS),
-    )
-    return section
+def provider_key(provider):
+    for name in CATALOG.get(provider, {}).get("env", []):
+        if os.environ.get(name):
+            return os.environ[name]
+    login = read_json(OPENCODE_AUTH, {}).get(provider, {})
+    return login.get("key") if login.get("type") == "api" else None
 
 
-def groq():
-    section = Section("Groq", "hare.fill", "live per model · resets 00:00 UTC", "https://console.groq.com/dashboard/usage")
-    headers = {"Authorization": f"Bearer {os.environ['GROQ_API_KEY']}", "Content-Type": "application/json"}
-    used_today = local_usage("groq", day_start_ms(timezone.utc))
-    if not used_today:
-        section.items.append(Item("No opencode use today", ""))
-        return section
-    # Groq limits are per model and only visible as headers, so probe just the models in use.
-    for model, _, _ in used_today:
-        body = {"model": model, "max_tokens": 1, "messages": [{"role": "user", "content": "hi"}]}
-        data, response_headers = http_json("https://api.groq.com/openai/v1/chat/completions", headers, body)
-        label = model.rsplit("/", 1)[-1]
-        limit = response_headers.get("x-ratelimit-limit-requests")
-        remaining = response_headers.get("x-ratelimit-remaining-requests")
+def apply_live_limit(item, api, key):
+    body = {"model": item.model, "max_tokens": 1, "messages": [{"role": "user", "content": "hi"}]}
+    data, headers = http_json(f"{api}/chat/completions", {"Authorization": f"Bearer {key}", "Content-Type": "application/json"}, body)
+    if "429" in data.get("error", ""):
+        item.value, item.used_fraction = "blocked", 1.0
+        return
+    if "404" in data.get("error", ""):
+        item.details.append("Provider no longer serves this model")
+        return
+    if "error" in data:
+        item.details.append("Live check failed: " + data["error"])
+        return
+    # Daily headers win; plain ones are per provider window, so the reset time is shown with them.
+    for window in ("-day", ""):
+        limit = headers.get(f"x-ratelimit-limit-requests{window}")
+        remaining = headers.get(f"x-ratelimit-remaining-requests{window}")
         if limit and remaining:
-            section.items.append(count_item(label, int(limit) - int(remaining), int(limit), "req"))
-        else:
-            section.items.append(Item(label, "blocked" if "429" in data.get("error", "") else data.get("error", "no limit data"), 1.0))
-    return section
+            limit, used = int(float(limit)), int(float(limit)) - int(float(remaining))
+            item.value, item.used_fraction = f"{used:,} / {limit:,} req", used / limit
+            reset = headers.get(f"x-ratelimit-reset-requests{window}")
+            if reset:
+                item.details.append(f"Limit resets in {reset}")
+            return
 
 
 def catalog_section(provider):
-    entry = CATALOG.get(provider, {})
-    section = Section(entry.get("name", provider), "cpu", "opencode only", entry.get("doc", ""))
-    section.items = local_items(provider, day_start_ms(None))
+    entry, known = CATALOG.get(provider, {}), KNOWN.get(provider, {})
+    zone = ZoneInfo(known["reset_zone"]) if "reset_zone" in known else None
+    daily = known.get("daily_requests")
+    limit_for_model = (lambda model: daily.get(model, daily["*"])) if daily else None
+    note = f"opencode · resets {local_reset_time(zone)}" if daily else "opencode"
+    section = Section(entry.get("name", provider), "cpu", note, known.get("link", entry.get("doc", "")))
+    section.items = local_items(provider, day_start_ms(zone), limit_for_model)
+    api = os.path.expandvars(entry.get("api") or known.get("api", ""))
+    key = provider_key(provider)
+    if not api or not key:
+        return section
+    section.note += " · live limits"
+    # Limits are often per model and only visible as response headers, so probe just the models used today.
+    for item in section.items:
+        if item.model:
+            apply_live_limit(item, api, key)
     return section
 
 
@@ -404,14 +421,14 @@ def run_provider(provider, check):
 
 
 def provider_checks():
-    live_checks = {"openrouter": openrouter, "cerebras": cerebras, "groq": groq, "cloudflare-workers-ai": cloudflare}
+    live_checks = {"openrouter": openrouter, "cerebras": cerebras, "cloudflare-workers-ai": cloudflare}
     checks = {"antigravity": antigravity} if glob.glob(ANTIGRAVITY_HUBS) else {}
     checks |= {"ollama": ollama, "lmstudio": lmstudio}
     checks |= {provider: check for provider, check in live_checks.items() if has_env(*CATALOG.get(provider, {}).get("env", ["-"]))}
     # A shared key name matches several catalog entries, so keyless sections need real use or a login.
     used = recent_opencode_providers() | set(read_json(OPENCODE_AUTH, {}))
     for provider in sorted(used - set(checks)):
-        checks[provider] = gemini if provider == "google" else lambda provider=provider: catalog_section(provider)
+        checks[provider] = lambda provider=provider: catalog_section(provider)
     for provider in read_json(OPENCODE_CONFIG, {}).get("disabled_providers", []):
         checks.pop(provider, None)
     return checks
