@@ -18,6 +18,9 @@ Free tiers are generous when you combine them (OpenRouter, Cerebras, Gemini, Z.a
 - Finds providers by itself: any of the 300+ providers in the [models.dev](https://models.dev) catalog shows up once you use it through opencode (last 7 days) or log in to it there, and disappears when you stop. Providers disabled in opencode stay hidden
 - Flags models the catalog marks deprecated or no longer offers
 - Shows Ollama and LM Studio models when they are running on your Mac
+- Estimates when a limit runs out at your current pace ("Runs out around 15:20")
+- Mac notification when a limit is nearly or fully used up, and when it is usable again
+- `llm-usage --pick` lists your recently used opencode models that still have room, most room first, as `provider/model`; `llm-usage --json` prints everything for scripts
 - Hide any provider you don't use from the menu (**Hide**), bring it back with **Show hidden**, or run `llm-usage --hide zai` / `llm-usage --show zai`. Hidden providers make no API calls.
 
 ## Supported providers

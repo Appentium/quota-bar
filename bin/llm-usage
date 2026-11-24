@@ -4,11 +4,12 @@ import glob
 import json
 import os
 import sqlite3
+import subprocess
 import sys
 import time
 import urllib.error
 import urllib.request
-from dataclasses import dataclass, field
+from dataclasses import asdict, dataclass, field
 from datetime import datetime, timedelta, timezone
 from zoneinfo import ZoneInfo
 
@@ -25,6 +26,11 @@ PROVIDER_NOTES = os.path.join(os.path.dirname(os.path.realpath(__file__)), "..",
 CLOUDFLARE_DAILY_NEURONS = 10_000
 CLOUDFLARE_OUT_OF_NEURONS = 4006
 HIDDEN_FILE = os.path.expanduser("~/.config/quota-bar/hidden.json")
+HISTORY_DB = os.path.expanduser("~/.local/share/quota-bar/history.db")
+HISTORY_DAYS = 8
+TREND_HOURS = 3
+MIN_TREND_SECONDS = 600
+PICK_UNKNOWN_USE = 0.5
 STATUS_ANSI = {"ok": "\033[92m", "warn": "\033[93m", "full": "\033[91m", "none": "\033[90m"}
 
 
@@ -127,13 +133,13 @@ def local_usage(provider, since_ms):
         return db.execute(query, (provider, since_ms)).fetchall()
 
 
-def recent_opencode_providers():
+def recent_opencode_models():
     if not os.path.exists(OPENCODE_DB):
         return set()
     since_ms = int((time.time() - RECENT_USE_DAYS * 86_400) * 1000)
-    query = "select distinct json_extract(data, '$.providerID') from message where time_created >= ?"
+    query = "select distinct json_extract(data, '$.providerID'), json_extract(data, '$.modelID') from message where time_created >= ?"
     with sqlite3.connect(f"file:{OPENCODE_DB}?mode=ro", uri=True) as db:
-        return {row[0] for row in db.execute(query, (since_ms,)) if row[0]}
+        return {(provider, model) for provider, model in db.execute(query, (since_ms,)) if provider and model}
 
 
 def model_notice(provider, model):
@@ -426,12 +432,79 @@ def provider_checks():
     checks |= {"ollama": ollama, "lmstudio": lmstudio}
     checks |= {provider: check for provider, check in live_checks.items() if has_env(*CATALOG.get(provider, {}).get("env", ["-"]))}
     # A shared key name matches several catalog entries, so keyless sections need real use or a login.
-    used = recent_opencode_providers() | set(read_json(OPENCODE_AUTH, {}))
+    used = {provider for provider, _ in recent_opencode_models()} | set(read_json(OPENCODE_AUTH, {}))
     for provider in sorted(used - set(checks)):
         checks[provider] = lambda provider=provider: catalog_section(provider)
     for provider in read_json(OPENCODE_CONFIG, {}).get("disabled_providers", []):
         checks.pop(provider, None)
     return checks
+
+
+def run_out_time(fraction, now, past):
+    start_time, start_fraction = now, fraction
+    for reading_time, reading_fraction in past:
+        # A higher earlier reading means the limit reset in between, so the trend starts after it.
+        if reading_fraction > start_fraction:
+            break
+        start_time, start_fraction = reading_time, reading_fraction
+    if fraction >= 1 or fraction <= start_fraction or now - start_time < MIN_TREND_SECONDS:
+        return None
+    seconds_left = (1 - fraction) * (now - start_time) / (fraction - start_fraction)
+    return now + seconds_left if seconds_left < 86_400 else None
+
+
+def status_alert(title, item, previous_fraction):
+    was_full = previous_fraction is not None and status_for(previous_fraction) == "full"
+    if item.status == "full" and not was_full:
+        state = "is used up" if item.used_fraction >= 1 else "is nearly out"
+        return f"{title} {item.label} {state}: {item.value}"
+    if was_full and item.status != "full":
+        return f"{title} {item.label} is usable again: {item.value}"
+    return None
+
+
+def track_history(sections):
+    os.makedirs(os.path.dirname(HISTORY_DB), exist_ok=True)
+    now = time.time()
+    alerts = []
+    with sqlite3.connect(HISTORY_DB) as db:
+        db.execute("create table if not exists readings (time real, provider text, label text, fraction real)")
+        for section in sections:
+            for item in section.items:
+                if item.used_fraction is None:
+                    continue
+                past = db.execute(
+                    "select time, fraction from readings where provider = ? and label = ? and time >= ? order by time desc",
+                    (section.provider, item.label, now - TREND_HOURS * 3600),
+                ).fetchall()
+                runs_out = run_out_time(item.used_fraction, now, past)
+                if runs_out:
+                    item.details.append("Runs out around " + datetime.fromtimestamp(runs_out).strftime("%a %H:%M") + " at this pace")
+                alert = status_alert(section.title, item, past[0][1] if past else None)
+                if alert:
+                    alerts.append(alert)
+                db.execute("insert into readings values (?, ?, ?, ?)", (now, section.provider, item.label, item.used_fraction))
+        db.execute("delete from readings where time < ?", (now - HISTORY_DAYS * 86_400,))
+    return alerts
+
+
+def notify(message):
+    subprocess.run(["osascript", "-e", f"display notification {json.dumps(message, ensure_ascii=False)} with title \"quota-bar\""], check=False)
+
+
+def usable_models(sections):
+    by_provider = {section.provider: section for section in sections}
+    ranked = []
+    for provider, model in recent_opencode_models():
+        section = by_provider.get(provider)
+        if not section or model_notice(provider, model):
+            continue
+        # Items without a model are provider-wide limits, so they cap every model of that provider.
+        fractions = [item.used_fraction for item in section.items if item.used_fraction is not None and item.model in ("", model)]
+        worst = max(fractions, default=PICK_UNKNOWN_USE)
+        if status_for(worst) != "full":
+            ranked.append((worst, f"{provider}/{model}"))
+    return [name for _, name in sorted(ranked)]
 
 
 def main():
@@ -447,7 +520,13 @@ def main():
     checks = provider_checks()
     sections = [run_provider(provider, check) for provider, check in checks.items() if provider not in hidden]
     sections = [section for section in sections if section]
-    if "--swiftbar" in sys.argv:
+    for alert in track_history(sections):
+        notify(alert)
+    if "--json" in sys.argv:
+        print(json.dumps([asdict(section) for section in sections], indent=2))
+    elif "--pick" in sys.argv:
+        print("\n".join(usable_models(sections)))
+    elif "--swiftbar" in sys.argv:
         print_swiftbar(sections, hidden)
     else:
         print_terminal(sections)
