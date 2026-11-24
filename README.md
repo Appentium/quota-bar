@@ -16,17 +16,19 @@ Free tiers are generous when you combine them (OpenRouter, Cerebras, Gemini, Z.a
 - Same view in the terminal: `llm-usage`
 - Single Python file, standard library only, works with the Python that ships with macOS
 - Providers without a key are simply hidden
+- Hide any provider you don't use from the menu (**Hide**), bring it back with **Show hidden**, or run `llm-usage --hide zai` / `llm-usage --show zai`. Hidden providers make no API calls.
 
 ## Supported providers
 
 | Provider | Source | What you see |
 |---|---|---|
 | OpenRouter | live API | free-model requests used of daily limit, credit spent |
-| Cerebras | live rate-limit headers | requests and tokens used today |
+| Cerebras | live rate-limit headers | requests and tokens used today, or blocked |
+| Groq | live rate-limit headers | requests used today per model you used through opencode |
 | Google Gemini | opencode history | requests per model vs the free-tier daily limit |
 | Z.ai | opencode history | requests and tokens per model |
 | OpenCode Zen | opencode history | requests and tokens per free model (e.g. DeepSeek V4.1 Flash) |
-| Cloudflare Workers AI | live GraphQL + opencode history | neurons used of 10,000/day, requests per model |
+| Cloudflare Workers AI | live GraphQL + probe | neurons used in the last 24 h of 10,000, per model, blocked status and when it frees up |
 | Antigravity | local Antigravity.app hub (must be running) | % left in every 5-hour and weekly pool, reset times |
 
 ## Install
@@ -53,19 +55,21 @@ Add whichever you have to `~/.zshrc`. Each key is only sent to its own provider.
 | `CEREBRAS_API_KEY` | cloud.cerebras.ai → API Keys |
 | `GEMINI_API_KEY` | aistudio.google.com → Get API key |
 | `GOOGLE_GENERATIVE_AI_API_KEY` | set to `$GEMINI_API_KEY` (the name opencode reads) |
+| `GROQ_API_KEY` | console.groq.com → API Keys |
 | `ZHIPU_API_KEY` | z.ai → API Keys |
 | `CLOUDFLARE_ACCOUNT_ID` | Cloudflare dashboard sidebar |
 | `CLOUDFLARE_API_KEY` | Cloudflare → API Tokens, Workers AI template plus **Account Analytics: Read** |
 
 ## Notes
 
-- The Cerebras and Cloudflare checks each send one 1-token request per refresh (about 96 a day at the default interval). Cloudflare can keep refusing calls after its 00:00 UTC reset, so its row shows "blocked" when the API returns 429.
+- The Cerebras check sends one 1-token request per refresh (about 96 a day at the default interval). Groq sends one per model you used today, and Cloudflare one only when it has usage in the last 24 h.
+- Cloudflare enforces its 10,000 free neurons over the last 24 hours, not per UTC day, so the row counts that window and shows when enough usage ages out.
 - Gemini, Z.ai and OpenCode Zen have no usage API, so only requests made through opencode are counted. Your AI Studio dashboard stays the source of truth.
 - Status colors: green under 70% used, yellow 70–90%, red 90% and above.
 
 ## Contributing
 
-Issues and pull requests for more providers (Groq, Mistral, GitHub Models, NVIDIA NIM…) are welcome. Each provider is one small function that returns a `Section`.
+Issues and pull requests for more providers (Mistral, GitHub Models, NVIDIA NIM…) are welcome. Each provider is one small function that returns a `Section`.
 
 ## License
 

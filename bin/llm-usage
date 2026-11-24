@@ -8,7 +8,7 @@ import sys
 import urllib.error
 import urllib.request
 from dataclasses import dataclass, field
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from zoneinfo import ZoneInfo
 
 OPENCODE_DB = os.path.expanduser("~/.local/share/opencode/opencode.db")
@@ -16,6 +16,9 @@ GROUP_MODELS_PREFIX = "Models within this group: "
 ANTIGRAVITY_HUBS = os.path.expanduser("~/.gemini/antigravity/daemon/hub_*.json")
 GEMINI_DAILY_REQUESTS = {"gemini-3.5-flash-lite": 500, "gemini-3.1-flash-lite": 500}
 GEMINI_DEFAULT_DAILY_REQUESTS = 20
+CLOUDFLARE_DAILY_NEURONS = 10_000
+CLOUDFLARE_OUT_OF_NEURONS = 4006
+HIDDEN_FILE = os.path.expanduser("~/.config/quota-bar/hidden.json")
 STATUS_ANSI = {"ok": "\033[92m", "warn": "\033[93m", "full": "\033[91m", "none": "\033[90m"}
 
 
@@ -46,13 +49,21 @@ class Section:
     note: str
     link: str
     items: list[Item] = field(default_factory=list)
+    provider: str = ""
 
 
 def http_json(url, headers, body=None):
-    request = urllib.request.Request(url, headers=headers, data=None if body is None else json.dumps(body).encode())
+    # Some providers sit behind bot filters that reject Python's default user agent.
+    request = urllib.request.Request(url, headers={"User-Agent": "quota-bar", **headers}, data=None if body is None else json.dumps(body).encode())
     try:
         with urllib.request.urlopen(request, timeout=20) as response:
             return json.load(response), response.headers
+    except urllib.error.HTTPError as error:
+        try:
+            body = json.load(error)
+        except ValueError:
+            body = {}
+        return {**body, "error": str(error)}, error.headers
     except (urllib.error.URLError, TimeoutError) as error:
         return {"error": str(error)}, {}
 
@@ -70,7 +81,9 @@ def count_item(label, used, limit, unit):
     return Item(label, f"{used:,} / {limit:,} {unit}", used / limit)
 
 
-def local_items(provider, since_ms, limit_for_model=None):
+def local_usage(provider, since_ms):
+    if not os.path.exists(OPENCODE_DB):
+        return []
     query = """
         select json_extract(m.data, '$.modelID'), count(*),
                sum(json_extract(p.data, '$.tokens.input') + json_extract(p.data, '$.tokens.output'))
@@ -79,7 +92,11 @@ def local_items(provider, since_ms, limit_for_model=None):
           and json_extract(m.data, '$.providerID') = ? and p.time_created >= ?
         group by 1 order by 2 desc"""
     with sqlite3.connect(f"file:{OPENCODE_DB}?mode=ro", uri=True) as db:
-        rows = db.execute(query, (provider, since_ms)).fetchall()
+        return db.execute(query, (provider, since_ms)).fetchall()
+
+
+def local_items(provider, since_ms, limit_for_model=None):
+    rows = local_usage(provider, since_ms)
     if not rows:
         return [Item("No opencode use today", "")]
     items = []
@@ -109,8 +126,9 @@ def antigravity():
                 section.items.append(Item(label, "paused", details=[bucket["description"]]))
                 continue
             left = bucket["remainingFraction"]
-            reset_local = datetime.fromisoformat(bucket["resetTime"].replace("Z", "+00:00")).astimezone().strftime("%a %H:%M")
-            details = [f"Resets {reset_local}"]
+            details = []
+            if "resetTime" in bucket:
+                details.append("Resets " + datetime.fromisoformat(bucket["resetTime"].replace("Z", "+00:00")).astimezone().strftime("%a %H:%M"))
             if group["description"].startswith(GROUP_MODELS_PREFIX):
                 details.append(group["description"].replace(GROUP_MODELS_PREFIX, "Shared by "))
             section.items.append(Item(label, f"{left:.0%} left", 1 - left, details))
@@ -132,16 +150,21 @@ def openrouter():
 
 def cerebras():
     section = Section("Cerebras", "bolt.fill", "live", "https://cloud.cerebras.ai")
-    body = {"model": "gpt-oss-120b", "max_tokens": 1, "messages": [{"role": "user", "content": "hi"}]}
     headers = {"Authorization": f"Bearer {os.environ['CEREBRAS_API_KEY']}", "Content-Type": "application/json"}
+    models, _ = http_json("https://api.cerebras.ai/v1/models", headers)
+    if "error" in models:
+        section.items.append(Item("Unavailable", models["error"]))
+        return section
+    body = {"model": models["data"][0]["id"], "max_tokens": 1, "messages": [{"role": "user", "content": "hi"}]}
     data, response_headers = http_json("https://api.cerebras.ai/v1/chat/completions", headers, body)
     if "error" in data:
-        section.items.append(Item("Unavailable", data["error"]))
+        section.items.append(Item("Requests", "blocked", 1.0, [data.get("message", data["error"])]))
         return section
     for kind, unit in (("requests", "req"), ("tokens", "tok")):
-        limit = int(response_headers[f"x-ratelimit-limit-{kind}-day"])
-        remaining = int(response_headers[f"x-ratelimit-remaining-{kind}-day"])
-        section.items.append(count_item(f"{kind.capitalize()} today", limit - remaining, limit, unit))
+        limit = response_headers.get(f"x-ratelimit-limit-{kind}-day")
+        remaining = response_headers.get(f"x-ratelimit-remaining-{kind}-day")
+        if limit and remaining:
+            section.items.append(count_item(f"{kind.capitalize()} today", int(limit) - int(remaining), int(limit), unit))
     return section
 
 
@@ -152,6 +175,27 @@ def gemini():
         day_start_ms(ZoneInfo("America/Los_Angeles")),
         lambda model: GEMINI_DAILY_REQUESTS.get(model, GEMINI_DEFAULT_DAILY_REQUESTS),
     )
+    return section
+
+
+def groq():
+    section = Section("Groq", "hare.fill", "live per model · resets 00:00 UTC", "https://console.groq.com/dashboard/usage")
+    headers = {"Authorization": f"Bearer {os.environ['GROQ_API_KEY']}", "Content-Type": "application/json"}
+    used_today = local_usage("groq", day_start_ms(timezone.utc))
+    if not used_today:
+        section.items.append(Item("No opencode use today", ""))
+        return section
+    # Groq limits are per model and only visible as headers, so probe just the models in use.
+    for model, _, _ in used_today:
+        body = {"model": model, "max_tokens": 1, "messages": [{"role": "user", "content": "hi"}]}
+        data, response_headers = http_json("https://api.groq.com/openai/v1/chat/completions", headers, body)
+        label = model.rsplit("/", 1)[-1]
+        limit = response_headers.get("x-ratelimit-limit-requests")
+        remaining = response_headers.get("x-ratelimit-remaining-requests")
+        if limit and remaining:
+            section.items.append(count_item(label, int(limit) - int(remaining), int(limit), "req"))
+        else:
+            section.items.append(Item(label, "blocked" if "429" in data.get("error", "") else data.get("error", "no limit data"), 1.0))
     return section
 
 
@@ -167,25 +211,72 @@ def opencode_zen():
     return section
 
 
-def cloudflare():
-    section = Section("Cloudflare", "cloud.fill", f"resets {local_reset_time(timezone.utc)}", "https://dash.cloudflare.com/?to=/:account/ai/workers-ai")
-    account = os.environ["CLOUDFLARE_ACCOUNT_ID"]
-    today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
-    query = f'{{viewer{{accounts(filter:{{accountTag:"{account}"}}){{aiInferenceAdaptiveGroups(limit:50,filter:{{date_geq:"{today}"}}){{sum{{totalNeurons}}}}}}}}}}'
-    headers = {"Authorization": f"Bearer {os.environ['CLOUDFLARE_API_KEY']}", "Content-Type": "application/json"}
+def cloudflare_hourly_neurons(account, headers, since):
+    query = f'{{viewer{{accounts(filter:{{accountTag:"{account}"}}){{aiInferenceAdaptiveGroups(limit:1000,filter:{{datetime_geq:"{since:%Y-%m-%dT%H:%M:%SZ}"}}){{sum{{totalNeurons}} dimensions{{datetimeHour modelId}}}}}}}}}}'
     data, _ = http_json("https://api.cloudflare.com/client/v4/graphql", headers, {"query": query})
-    if data.get("data"):
-        groups = data["data"]["viewer"]["accounts"][0]["aiInferenceAdaptiveGroups"]
-        section.items.append(count_item("Neurons", round(sum(group["sum"]["totalNeurons"] for group in groups)), 10_000, "neu"))
-    else:
+    if not data.get("data"):
+        return None
+    return [
+        (datetime.fromisoformat(group["dimensions"]["datetimeHour"].replace("Z", "+00:00")), group["dimensions"]["modelId"], group["sum"]["totalNeurons"])
+        for group in data["data"]["viewer"]["accounts"][0]["aiInferenceAdaptiveGroups"]
+        if group["sum"]["totalNeurons"]
+    ]
+
+
+def cloudflare_frees_at(hourly):
+    used = sum(neurons for _, _, neurons in hourly)
+    for hour, _, neurons in sorted(hourly):
+        used -= neurons
+        if used < CLOUDFLARE_DAILY_NEURONS:
+            return hour + timedelta(hours=25)
+    return None
+
+
+def cloudflare():
+    section = Section("Cloudflare", "cloud.fill", "rolling 24 h", "https://dash.cloudflare.com/?to=/:account/ai/workers-ai")
+    account = os.environ["CLOUDFLARE_ACCOUNT_ID"]
+    headers = {"Authorization": f"Bearer {os.environ['CLOUDFLARE_API_KEY']}", "Content-Type": "application/json"}
+    # The free cap is enforced over the last 24 h, not per UTC day, so a calendar-day counter reads 0 while blocked.
+    since = datetime.now(timezone.utc).replace(minute=0, second=0, microsecond=0) - timedelta(hours=24)
+    hourly = cloudflare_hourly_neurons(account, headers, since)
+    if hourly is None:
         section.items.append(Item("Neurons", "needs Analytics Read", details=["Add 'Account Analytics: Read' to the API token"]))
-    probe_url = f"https://api.cloudflare.com/client/v4/accounts/{account}/ai/run/@cf/meta/llama-3.2-1b-instruct"
+        return section
+    used = round(sum(neurons for _, _, neurons in hourly))
+    item = count_item("Neurons", used, CLOUDFLARE_DAILY_NEURONS, "neu")
+    frees_at = cloudflare_frees_at(hourly) if used >= CLOUDFLARE_DAILY_NEURONS else None
+    if frees_at:
+        item.details.append("Frees up around " + frees_at.astimezone().strftime("%a %H:%M"))
+    section.items.append(item)
+    per_model = {}
+    for _, model, neurons in hourly:
+        per_model[model] = per_model.get(model, 0) + neurons
+    models_by_use = sorted(per_model, key=lambda model: -per_model[model])
+    for model in models_by_use:
+        section.items.append(Item(model.rsplit("/", 1)[-1], f"{round(per_model[model]):,} neu"))
+    if not models_by_use:
+        return section
+    probe_url = f"https://api.cloudflare.com/client/v4/accounts/{account}/ai/run/{models_by_use[0]}"
     probe, _ = http_json(probe_url, headers, {"messages": [{"role": "user", "content": "hi"}], "max_tokens": 1})
-    # Enforcement can outlast the 00:00 UTC reset, so the neuron counter alone can read 0 while blocked.
-    if "429" in probe.get("error", ""):
-        section.items.append(Item("Requests", "blocked", 1.0, ["API refuses calls even if the counter reads 0"]))
-    section.items += local_items("cloudflare-workers-ai", day_start_ms(timezone.utc))
+    error_codes = [error.get("code") for error in probe.get("errors", [])]
+    if CLOUDFLARE_OUT_OF_NEURONS in error_codes:
+        section.items.insert(0, Item("Requests", "blocked", 1.0, ["Daily free neurons used up"]))
+    elif "error" in probe:
+        section.items.insert(0, Item("Requests", "probe failed", details=[probe["error"]]))
     return section
+
+
+def load_hidden():
+    if not os.path.exists(HIDDEN_FILE):
+        return {}
+    with open(HIDDEN_FILE) as hidden_file:
+        return json.load(hidden_file)
+
+
+def save_hidden(hidden):
+    os.makedirs(os.path.dirname(HIDDEN_FILE), exist_ok=True)
+    with open(HIDDEN_FILE, "w") as hidden_file:
+        json.dump(hidden, hidden_file, indent=2)
 
 
 def has_env(*names):
@@ -211,7 +302,8 @@ def print_terminal(sections):
         print()
 
 
-def print_swiftbar(sections):
+def print_swiftbar(sections, hidden):
+    script = os.path.abspath(sys.argv[0])
     fractions = [item.used_fraction for section in sections for item in section.items if item.used_fraction is not None]
     overall = status_for(sum(fractions) / len(fractions) if fractions else None)
     reset = "\033[0m"
@@ -232,23 +324,51 @@ def print_swiftbar(sections):
             for detail in item.details:
                 print(f"--{detail} | size=12")
     print("---")
+    print("Hide | sfimage=eye.slash")
+    for section in sections:
+        print(f"--{section.title} | bash={script} param1=--hide param2={section.provider} param3='{section.title}' terminal=false refresh=true")
+    if hidden:
+        print("Show hidden | sfimage=eye")
+        for provider, title in hidden.items():
+            print(f"--{title} | bash={script} param1=--show param2={provider} terminal=false refresh=true")
     print("Refresh | refresh=true sfimage=arrow.clockwise")
 
 
+def run_provider(provider):
+    try:
+        section = provider()
+    except Exception as error:
+        # One provider changing its response must not blank the whole menu.
+        section = Section(provider.__name__.replace("_", " ").title(), "exclamationmark.triangle", "check failed", "")
+        section.items.append(Item("Error", f"{type(error).__name__}: {error}"))
+    section.provider = provider.__name__
+    return section
+
+
 def main():
+    hidden = load_hidden()
+    if sys.argv[1:2] == ["--hide"]:
+        provider = sys.argv[2]
+        save_hidden({**hidden, provider: sys.argv[3] if len(sys.argv) > 3 else provider})
+        return
+    if sys.argv[1:2] == ["--show"]:
+        hidden.pop(sys.argv[2], None)
+        save_hidden(hidden)
+        return
     has_opencode = os.path.exists(OPENCODE_DB)
     providers = [
         (antigravity, bool(glob.glob(ANTIGRAVITY_HUBS))),
         (openrouter, has_env("OPENROUTER_API_KEY")),
         (cerebras, has_env("CEREBRAS_API_KEY")),
+        (groq, has_env("GROQ_API_KEY")),
         (gemini, has_opencode),
         (zai, has_opencode),
         (opencode_zen, has_opencode),
-        (cloudflare, has_opencode and has_env("CLOUDFLARE_ACCOUNT_ID", "CLOUDFLARE_API_KEY")),
+        (cloudflare, has_env("CLOUDFLARE_ACCOUNT_ID", "CLOUDFLARE_API_KEY")),
     ]
-    sections = [provider() for provider, ready in providers if ready]
+    sections = [run_provider(provider) for provider, ready in providers if ready and provider.__name__ not in hidden]
     if "--swiftbar" in sys.argv:
-        print_swiftbar(sections)
+        print_swiftbar(sections, hidden)
     else:
         print_terminal(sections)
 
