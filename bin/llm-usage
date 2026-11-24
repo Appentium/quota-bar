@@ -5,6 +5,7 @@ import json
 import os
 import sqlite3
 import sys
+import time
 import urllib.error
 import urllib.request
 from dataclasses import dataclass, field
@@ -12,6 +13,12 @@ from datetime import datetime, timedelta, timezone
 from zoneinfo import ZoneInfo
 
 OPENCODE_DB = os.path.expanduser("~/.local/share/opencode/opencode.db")
+OPENCODE_AUTH = os.path.expanduser("~/.local/share/opencode/auth.json")
+OPENCODE_CONFIG = os.path.expanduser("~/.config/opencode/opencode.json")
+OPENCODE_CATALOG = os.path.expanduser("~/.cache/opencode/models.json")
+OWN_CATALOG = os.path.expanduser("~/.cache/quota-bar/models.json")
+CATALOG_URL = "https://models.dev/api.json"
+RECENT_USE_DAYS = 7
 GROUP_MODELS_PREFIX = "Models within this group: "
 ANTIGRAVITY_HUBS = os.path.expanduser("~/.gemini/antigravity/daemon/hub_*.json")
 GEMINI_DAILY_REQUESTS = {"gemini-3.5-flash-lite": 500, "gemini-3.1-flash-lite": 500}
@@ -68,6 +75,30 @@ def http_json(url, headers, body=None):
         return {"error": str(error)}, {}
 
 
+def read_json(path, default):
+    if not os.path.exists(path):
+        return default
+    with open(path) as json_file:
+        return json.load(json_file)
+
+
+def load_catalog():
+    if os.path.exists(OPENCODE_CATALOG):
+        return read_json(OPENCODE_CATALOG, {})
+    # Without opencode, keep our own copy of the same catalog and refresh it daily; it is several MB.
+    if not os.path.exists(OWN_CATALOG) or time.time() - os.path.getmtime(OWN_CATALOG) > 86_400:
+        catalog, _ = http_json(CATALOG_URL, {})
+        if "error" in catalog:
+            return read_json(OWN_CATALOG, {})
+        os.makedirs(os.path.dirname(OWN_CATALOG), exist_ok=True)
+        with open(OWN_CATALOG, "w") as catalog_file:
+            json.dump(catalog, catalog_file)
+    return read_json(OWN_CATALOG, {})
+
+
+CATALOG = load_catalog()
+
+
 def day_start_ms(zone):
     now = datetime.now(zone)
     return int(now.replace(hour=0, minute=0, second=0, microsecond=0).timestamp() * 1000)
@@ -95,6 +126,24 @@ def local_usage(provider, since_ms):
         return db.execute(query, (provider, since_ms)).fetchall()
 
 
+def recent_opencode_providers():
+    if not os.path.exists(OPENCODE_DB):
+        return set()
+    since_ms = int((time.time() - RECENT_USE_DAYS * 86_400) * 1000)
+    query = "select distinct json_extract(data, '$.providerID') from message where time_created >= ?"
+    with sqlite3.connect(f"file:{OPENCODE_DB}?mode=ro", uri=True) as db:
+        return {row[0] for row in db.execute(query, (since_ms,)) if row[0]}
+
+
+def model_notice(provider, model):
+    catalog_models = CATALOG.get(provider, {}).get("models")
+    if not catalog_models:
+        return None
+    if model not in catalog_models:
+        return "No longer offered"
+    return "Deprecated" if catalog_models[model].get("status") == "deprecated" else None
+
+
 def local_items(provider, since_ms, limit_for_model=None):
     rows = local_usage(provider, since_ms)
     if not rows:
@@ -103,6 +152,9 @@ def local_items(provider, since_ms, limit_for_model=None):
     for model, requests, tokens in rows:
         label = model.rsplit("/", 1)[-1]
         item = count_item(label, requests, limit_for_model(model), "req") if limit_for_model else Item(label, f"{requests:,} req")
+        notice = model_notice(provider, model)
+        if notice:
+            item.details.append(notice)
         item.details.append(f"{tokens or 0:,} tokens today")
         items.append(item)
     return items
@@ -199,16 +251,28 @@ def groq():
     return section
 
 
-def zai():
-    section = Section("Z.ai", "z.square.fill", "opencode only · no daily cap", "https://z.ai/manage-apikey/apikey-list")
-    section.items = local_items("zai", day_start_ms(None))
+def catalog_section(provider):
+    entry = CATALOG.get(provider, {})
+    section = Section(entry.get("name", provider), "cpu", "opencode only", entry.get("doc", ""))
+    section.items = local_items(provider, day_start_ms(None))
     return section
 
 
-def opencode_zen():
-    section = Section("OpenCode Zen", "chevron.left.forwardslash.chevron.right", "opencode only · free models, rate-limited", "https://opencode.ai/zen")
-    section.items = local_items("opencode", day_start_ms(None))
+def local_server(title, url, model_names):
+    data, _ = http_json(url, {})
+    if "error" in data:
+        return None
+    section = Section(title, "desktopcomputer", "on this Mac · no limit", "")
+    section.items = [Item(name, "") for name in model_names(data)] or [Item("No models installed", "")]
     return section
+
+
+def ollama():
+    return local_server("Ollama", "http://127.0.0.1:11434/api/tags", lambda data: [model["name"] for model in data["models"]])
+
+
+def lmstudio():
+    return local_server("LM Studio", "http://127.0.0.1:1234/v1/models", lambda data: [model["id"] for model in data["data"]])
 
 
 def cloudflare_hourly_neurons(account, headers, since):
@@ -264,13 +328,6 @@ def cloudflare():
     elif "error" in probe:
         section.items.insert(0, Item("Requests", "probe failed", details=[probe["error"]]))
     return section
-
-
-def load_hidden():
-    if not os.path.exists(HIDDEN_FILE):
-        return {}
-    with open(HIDDEN_FILE) as hidden_file:
-        return json.load(hidden_file)
 
 
 def save_hidden(hidden):
@@ -334,19 +391,34 @@ def print_swiftbar(sections, hidden):
     print("Refresh | refresh=true sfimage=arrow.clockwise")
 
 
-def run_provider(provider):
+def run_provider(provider, check):
     try:
-        section = provider()
+        section = check()
     except Exception as error:
         # One provider changing its response must not blank the whole menu.
-        section = Section(provider.__name__.replace("_", " ").title(), "exclamationmark.triangle", "check failed", "")
+        section = Section(CATALOG.get(provider, {}).get("name", provider), "exclamationmark.triangle", "check failed", "")
         section.items.append(Item("Error", f"{type(error).__name__}: {error}"))
-    section.provider = provider.__name__
+    if section:
+        section.provider = provider
     return section
 
 
+def provider_checks():
+    live_checks = {"openrouter": openrouter, "cerebras": cerebras, "groq": groq, "cloudflare-workers-ai": cloudflare}
+    checks = {"antigravity": antigravity} if glob.glob(ANTIGRAVITY_HUBS) else {}
+    checks |= {"ollama": ollama, "lmstudio": lmstudio}
+    checks |= {provider: check for provider, check in live_checks.items() if has_env(*CATALOG.get(provider, {}).get("env", ["-"]))}
+    # A shared key name matches several catalog entries, so keyless sections need real use or a login.
+    used = recent_opencode_providers() | set(read_json(OPENCODE_AUTH, {}))
+    for provider in sorted(used - set(checks)):
+        checks[provider] = gemini if provider == "google" else lambda provider=provider: catalog_section(provider)
+    for provider in read_json(OPENCODE_CONFIG, {}).get("disabled_providers", []):
+        checks.pop(provider, None)
+    return checks
+
+
 def main():
-    hidden = load_hidden()
+    hidden = read_json(HIDDEN_FILE, {})
     if sys.argv[1:2] == ["--hide"]:
         provider = sys.argv[2]
         save_hidden({**hidden, provider: sys.argv[3] if len(sys.argv) > 3 else provider})
@@ -355,18 +427,9 @@ def main():
         hidden.pop(sys.argv[2], None)
         save_hidden(hidden)
         return
-    has_opencode = os.path.exists(OPENCODE_DB)
-    providers = [
-        (antigravity, bool(glob.glob(ANTIGRAVITY_HUBS))),
-        (openrouter, has_env("OPENROUTER_API_KEY")),
-        (cerebras, has_env("CEREBRAS_API_KEY")),
-        (groq, has_env("GROQ_API_KEY")),
-        (gemini, has_opencode),
-        (zai, has_opencode),
-        (opencode_zen, has_opencode),
-        (cloudflare, has_env("CLOUDFLARE_ACCOUNT_ID", "CLOUDFLARE_API_KEY")),
-    ]
-    sections = [run_provider(provider) for provider, ready in providers if ready and provider.__name__ not in hidden]
+    checks = provider_checks()
+    sections = [run_provider(provider, check) for provider, check in checks.items() if provider not in hidden]
+    sections = [section for section in sections if section]
     if "--swiftbar" in sys.argv:
         print_swiftbar(sections, hidden)
     else:

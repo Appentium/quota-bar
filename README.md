@@ -15,7 +15,9 @@ Free tiers are generous when you combine them (OpenRouter, Cerebras, Gemini, Z.a
 - Click any provider to open its dashboard
 - Same view in the terminal: `llm-usage`
 - Single Python file, standard library only, works with the Python that ships with macOS
-- Providers without a key are simply hidden
+- Finds providers by itself: any of the 300+ providers in the [models.dev](https://models.dev) catalog shows up once you use it through opencode (last 7 days) or log in to it there, and disappears when you stop. Providers disabled in opencode stay hidden
+- Flags models the catalog marks deprecated or no longer offers
+- Shows Ollama and LM Studio models when they are running on your Mac
 - Hide any provider you don't use from the menu (**Hide**), bring it back with **Show hidden**, or run `llm-usage --hide zai` / `llm-usage --show zai`. Hidden providers make no API calls.
 
 ## Supported providers
@@ -26,8 +28,8 @@ Free tiers are generous when you combine them (OpenRouter, Cerebras, Gemini, Z.a
 | Cerebras | live rate-limit headers | requests and tokens used today, or blocked |
 | Groq | live rate-limit headers | requests used today per model you used through opencode |
 | Google Gemini | opencode history | requests per model vs the free-tier daily limit |
-| Z.ai | opencode history | requests and tokens per model |
-| OpenCode Zen | opencode history | requests and tokens per free model (e.g. DeepSeek V4.1 Flash) |
+| Any other provider (Z.ai, OpenCode Zen, Mistral, NVIDIA…) | opencode history | requests and tokens per model |
+| Ollama, LM Studio | local server | installed models |
 | Cloudflare Workers AI | live GraphQL + probe | neurons used in the last 24 h of 10,000, per model, blocked status and when it frees up |
 | Antigravity | local Antigravity.app hub (must be running) | % left in every 5-hour and weekly pool, reset times |
 
